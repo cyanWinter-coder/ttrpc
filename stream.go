@@ -18,8 +18,8 @@ package ttrpc
 
 import (
 	"context"
+	"errors"
 	"sync"
-	"time"
 )
 
 type streamID uint32
@@ -30,75 +30,102 @@ type streamMessage struct {
 }
 
 type stream struct {
-	id     streamID
-	sender sender
-	recv   chan *streamMessage
+	id      streamID
+	sender  sender
+	queue   *streamQueue[*streamMessage]
+	release func(*streamMessage)
 
 	closeOnce sync.Once
+	mu        sync.Mutex
 	recvErr   error
-	recvClose chan struct{}
 }
 
-func newStream(id streamID, send sender, recvBuf int) *stream {
+func newStream(id streamID, send sender, policy StreamBufferPolicy, release func(*streamMessage)) *stream {
 	return &stream{
-		id:        id,
-		sender:    send,
-		recv:      make(chan *streamMessage, recvBuf),
-		recvClose: make(chan struct{}),
+		id:      id,
+		sender:  send,
+		queue:   newStreamQueue[*streamMessage](uint32(id), policy, release),
+		release: release,
 	}
 }
 
+// closeWithError moves the stream to its terminal state. Messages which were
+// already buffered remain available to the consumer; the terminal error is
+// reported only once the buffer has been drained. The first error wins, which
+// keeps a more specific cause from being replaced by the generic ErrClosed
+// used during teardown.
 func (s *stream) closeWithError(err error) error {
 	s.closeOnce.Do(func() {
-		if err != nil {
-			s.recvErr = err
-		} else {
-			s.recvErr = ErrClosed
+		if err == nil {
+			err = ErrClosed
 		}
-		close(s.recvClose)
+		s.mu.Lock()
+		s.recvErr = err
+		s.mu.Unlock()
+		s.queue.close(err, false)
 	})
 	return nil
 }
 
-func (s *stream) send(mt messageType, flags uint8, b []byte) error {
-	return s.sender.send(uint32(s.id), mt, flags, b)
+// discard drops buffered messages and marks the stream terminal. It is used
+// when nobody will consume the stream anymore, so the payloads can return to
+// the pool immediately.
+func (s *stream) discard(err error) {
+	s.closeWithError(err)
+	s.queue.close(s.terminalError(), true)
+}
+
+func (s *stream) terminalError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recvErr
+}
+
+// send writes a frame for this stream. A closed connection and a cancelled
+// caller are reported by the sender; the stream itself stays writable after a
+// remote half-close, matching the protocol's independent local/remote closed
+// states.
+func (s *stream) send(ctx context.Context, mt messageType, flags uint8, b []byte) error {
+	return s.sender.send(ctx, uint32(s.id), mt, flags, b)
 }
 
 // receive delivers a message to this stream from the connection receive loop.
-// If the stream's recv buffer is full, it waits up to 1 second for the
-// consumer to make progress. This keeps the receive loop moving for other
-// streams while still providing backpressure under normal operation. If the
-// timeout expires the stream is closed with ErrStreamFull.
+//
+// The message is queued in the stream's bounded buffer. If the buffer is full
+// the receive loop waits up to the configured budget for the consumer to make
+// progress; because the budget is per stream, one slow consumer cannot stall
+// delivery for other streams on the connection. If the budget expires the
+// stream is terminated with ErrStreamFull. Cancelling ctx or closing the
+// stream releases the wait immediately.
 func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
-	select {
-	case <-s.recvClose:
-		return s.recvErr
-	default:
-	}
-	select {
-	case <-s.recvClose:
-		return s.recvErr
-	case s.recv <- msg:
+	err := s.queue.push(ctx, msg)
+	switch {
+	case err == nil:
 		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	case errors.Is(err, ErrStreamFull):
+		s.closeWithError(ErrStreamFull)
+		s.releaseMessage(msg)
+		return ErrStreamFull
+	case errors.Is(err, errStreamBufferClosed):
+		s.releaseMessage(msg)
+		return s.terminalError()
 	default:
-		// If recv channel is full, wait up to a second for an item
-		// to drain and unblock, otherwise close the stream.
-		select {
-		case <-s.recvClose:
-			return s.recvErr
-		case s.recv <- msg:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-			s.closeWithError(ErrStreamFull)
-			return ErrStreamFull
-		}
+		// The wait was cancelled; the caller owns the message buffer.
+		s.releaseMessage(msg)
+		return err
 	}
 }
 
+func (s *stream) releaseMessage(msg *streamMessage) {
+	if s.release != nil && msg != nil {
+		s.release(msg)
+	}
+}
+
+func (s *stream) stats() StreamBufferStats {
+	return s.queue.snapshot()
+}
+
 type sender interface {
-	send(uint32, messageType, uint8, []byte) error
+	send(ctx context.Context, streamID uint32, mt messageType, flags uint8, b []byte) error
 }

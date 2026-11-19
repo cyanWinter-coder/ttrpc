@@ -42,7 +42,9 @@ type Client struct {
 	streamLock   sync.RWMutex
 	streams      map[streamID]*stream
 	nextStreamID streamID
-	sendLock     sync.Mutex
+	sendLock     chan struct{}
+
+	streamPolicy StreamBufferPolicy
 
 	ctx    context.Context
 	closed func()
@@ -68,6 +70,19 @@ func WithOnClose(onClose func()) ClientOpts {
 func WithUnaryClientInterceptor(i UnaryClientInterceptor) ClientOpts {
 	return func(c *Client) {
 		c.interceptor = i
+	}
+}
+
+// WithClientStreamBufferPolicy configures per-stream receive buffering for
+// streams created by this client. The zero value keeps the default policy.
+//
+// The policy bounds how many messages are buffered for each stream and how
+// long the connection's receive loop waits for a slow consumer before failing
+// only that stream with ErrStreamFull. It changes local behavior only and is
+// compatible with any server.
+func WithClientStreamBufferPolicy(policy StreamBufferPolicy) ClientOpts {
+	return func(c *Client) {
+		c.streamPolicy = policy
 	}
 }
 
@@ -117,11 +132,13 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		channel:         channel,
 		streams:         make(map[streamID]*stream),
 		nextStreamID:    1,
+		sendLock:        make(chan struct{}, 1),
 		closed:          cancel,
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
 	}
+	c.sendLock <- struct{}{}
 
 	for _, o := range opts {
 		o(c)
@@ -135,10 +152,47 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 	return c
 }
 
-func (c *Client) send(sid uint32, mt messageType, flags uint8, b []byte) error {
-	c.sendLock.Lock()
-	defer c.sendLock.Unlock()
-	return c.channel.send(sid, mt, flags, b)
+// acquireSend acquires the connection-wide send serializer. The acquisition is
+// cancellable: a request whose context expires while another request holds the
+// serializer returns immediately instead of waiting for the writer, and a
+// closing connection releases it.
+func (c *Client) acquireSend(ctx context.Context) error {
+	// Prefer the cancellation check over the lock so a caller which is
+	// already done never competes for the serializer.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-c.sendLock:
+		if err := ctx.Err(); err != nil {
+			c.releaseSend()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return ErrClosed
+	}
+}
+
+func (c *Client) releaseSend() {
+	select {
+	case c.sendLock <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) send(ctx context.Context, sid uint32, mt messageType, flags uint8, b []byte) error {
+	if err := c.acquireSend(ctx); err != nil {
+		return err
+	}
+	defer c.releaseSend()
+
+	if err := c.ctx.Err(); err != nil {
+		return ErrClosed
+	}
+	return filterCloseErr(c.channel.send(sid, mt, flags, b))
 }
 
 // Call makes a unary request and returns with response
@@ -207,6 +261,12 @@ type clientStream struct {
 	remoteClosed bool
 }
 
+// StreamBufferStats returns a snapshot of the stream's receive buffer,
+// allowing callers to observe per-stream backpressure.
+func (cs *clientStream) StreamBufferStats() StreamBufferStats {
+	return cs.s.stats()
+}
+
 func (cs *clientStream) CloseSend() error {
 	if !cs.desc.StreamingClient {
 		return fmt.Errorf("%w: cannot close non-streaming client", ErrProtocol)
@@ -214,7 +274,7 @@ func (cs *clientStream) CloseSend() error {
 	if cs.localClosed {
 		return ErrStreamClosed
 	}
-	err := cs.s.send(messageTypeData, flagRemoteClosed|flagNoData, nil)
+	err := cs.s.send(cs.ctx, messageTypeData, flagRemoteClosed|flagNoData, nil)
 	if err != nil {
 		return filterCloseErr(err)
 	}
@@ -241,7 +301,7 @@ func (cs *clientStream) SendMsg(m any) error {
 		}
 	}
 
-	err = cs.s.send(messageTypeData, 0, payload)
+	err = cs.s.send(cs.ctx, messageTypeData, 0, payload)
 	if err != nil {
 		return filterCloseErr(err)
 	}
@@ -254,18 +314,18 @@ func (cs *clientStream) RecvMsg(m any) error {
 		return io.EOF
 	}
 
-	var msg *streamMessage
-	select {
-	case <-cs.ctx.Done():
-		return cs.ctx.Err()
-	case <-cs.s.recvClose:
-		// If recv has a pending message, process that first
-		select {
-		case msg = <-cs.s.recv:
-		default:
-			return cs.s.recvErr
+	msg, err := cs.s.queue.next(cs.ctx)
+	if err != nil {
+		// A cancelled call returns the context error; a torn-down connection
+		// returns the terminal stream error. Neither path consumes a message,
+		// so a read either succeeds with data or reports the close error.
+		if cs.ctx.Err() != nil {
+			// Nobody will consume this stream anymore, so unregister it and
+			// release whatever it buffered instead of retaining it until the
+			// peer finishes the stream.
+			cs.c.deleteStream(cs.s)
 		}
-	case msg = <-cs.s.recv:
+		return err
 	}
 
 	switch msg.header.Type {
@@ -292,6 +352,7 @@ func (cs *clientStream) RecvMsg(m any) error {
 		return nil
 	case messageTypeData:
 		if !cs.desc.StreamingServer {
+			cs.c.channel.putmbuf(msg.payload)
 			cs.c.deleteStream(cs.s)
 			cs.remoteClosed = true
 			return fmt.Errorf("received data from non-streaming server: %w", ErrProtocol)
@@ -301,6 +362,7 @@ func (cs *clientStream) RecvMsg(m any) error {
 			cs.remoteClosed = true
 
 			if msg.header.Flags&flagNoData == flagNoData {
+				cs.c.channel.putmbuf(msg.payload)
 				return io.EOF
 			}
 		}
@@ -312,6 +374,9 @@ func (cs *clientStream) RecvMsg(m any) error {
 		}
 		return nil
 	default:
+		cs.c.channel.putmbuf(msg.payload)
+		cs.c.deleteStream(cs.s)
+		cs.remoteClosed = true
 		return fmt.Errorf("unexpected %q message received: %w", msg.header.Type, ErrProtocol)
 	}
 }
@@ -369,38 +434,45 @@ func (c *Client) receiveLoop() error {
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
+				if msg.payload != nil {
+					c.channel.putmbuf(msg.payload)
+				}
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
 			}
 
 			if err != nil {
 				s.closeWithError(err)
-			} else {
-				if err := s.receive(c.ctx, msg); err != nil {
-					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
+			} else if err := s.receive(c.ctx, msg); err != nil {
+				// If the stream became terminal, stop routing frames to it
+				// while keeping its buffered messages for the consumer. On a
+				// connection shutdown cleanupStreams still owns the stream.
+				if s.terminalError() != nil {
+					c.removeStream(s)
 				}
+				log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
 			}
 		}
 	}
 }
 
-// createStream creates a new stream and registers it with the client
-// Introduce stream types for multiple or single response
-func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, error) {
-	// sendLock must be held across both allocation of the stream ID and sending it across the wire.
-	// This ensures that new stream IDs sent on the wire are always increasing, which is a
-	// requirement of the TTRPC protocol.
-	// This use of sendLock could be split into another mutex that covers stream creation + first send,
-	// and just use sendLock to guard writing to the wire, but for now it seems simpler to have fewer mutexes.
-	c.sendLock.Lock()
-	defer c.sendLock.Unlock()
+// createStream creates a new stream and registers it with the client.
+// Introduce stream types for multiple or single response.
+func (c *Client) createStream(ctx context.Context, flags uint8, b []byte, policy StreamBufferPolicy) (*stream, error) {
+	// The send serializer must be held across both allocation of the stream ID
+	// and sending it across the wire. This ensures that new stream IDs sent on
+	// the wire are always increasing, which is a requirement of the TTRPC
+	// protocol. Acquisition is cancellable so a caller queued behind a stalled
+	// writer still observes its own deadline.
+	if err := c.acquireSend(ctx); err != nil {
+		return nil, err
+	}
+	defer c.releaseSend()
 
-	// Check if closed since lock acquired to prevent adding
+	// Check if closed since the serializer was acquired to prevent adding
 	// anything after cleanup completes
-	select {
-	case <-c.ctx.Done():
+	if err := c.ctx.Err(); err != nil {
 		return nil, ErrClosed
-	default:
 	}
 
 	var s *stream
@@ -411,13 +483,15 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 
 		// Check if closed since lock acquired to prevent adding
 		// anything after cleanup completes
-		select {
-		case <-c.ctx.Done():
+		if err := c.ctx.Err(); err != nil {
 			return ErrClosed
-		default:
 		}
 
-		s = newStream(c.nextStreamID, c, recvBuf)
+		s = newStream(c.nextStreamID, c, policy, func(msg *streamMessage) {
+			if msg != nil && msg.payload != nil {
+				c.channel.putmbuf(msg.payload)
+			}
+		})
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
 
@@ -427,17 +501,27 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	}
 
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
-		return s, filterCloseErr(err)
+		c.deleteStream(s)
+		return nil, filterCloseErr(err)
 	}
 
 	return s, nil
 }
 
-func (c *Client) deleteStream(s *stream) {
+// removeStream unregisters a terminal stream while leaving its buffered
+// messages for whoever is still consuming it. The stream ID is never reused,
+// so no later frame can belong to it.
+func (c *Client) removeStream(s *stream) {
 	c.streamLock.Lock()
 	delete(c.streams, s.id)
 	c.streamLock.Unlock()
-	s.closeWithError(nil)
+}
+
+// deleteStream unregisters a finished stream. Buffered messages are released
+// because the consumer has observed the end of the stream.
+func (c *Client) deleteStream(s *stream) {
+	c.removeStream(s)
+	s.discard(nil)
 }
 
 func (c *Client) getStream(sid streamID) *stream {
@@ -447,6 +531,9 @@ func (c *Client) getStream(sid streamID) *stream {
 	return s
 }
 
+// cleanupStreams terminates every remaining stream with err. Buffered
+// messages stay readable for a consumer waiting on them, so a final response
+// which raced with the connection close is still delivered before the error.
 func (c *Client) cleanupStreams(err error) {
 	c.streamLock.Lock()
 	defer c.streamLock.Unlock()
@@ -517,7 +604,7 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 	} else {
 		flags = flagRemoteClosed
 	}
-	s, err := c.createStream(flags, p, streamRecvBufferSize)
+	s, err := c.createStream(ctx, flags, p, c.streamPolicy)
 	if err != nil {
 		return nil, err
 	}
@@ -536,26 +623,19 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 		return err
 	}
 
-	s, err := c.createStream(0, p, 1)
+	// A unary response is a single message, so there is no reason to buffer
+	// more than one.
+	s, err := c.createStream(ctx, 0, p, c.streamPolicy.withCapacity(1))
 	if err != nil {
 		return err
 	}
 	defer c.deleteStream(s)
 
-	var msg *streamMessage
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.ctx.Done():
-		return ErrClosed
-	case <-s.recvClose:
-		// If recv has a pending message, process that first
-		select {
-		case msg = <-s.recv:
-		default:
-			return s.recvErr
-		}
-	case msg = <-s.recv:
+	// Buffered messages are preferred over the terminal error, so a response
+	// which raced with the connection close is still delivered to the caller.
+	msg, err := s.queue.next(ctx)
+	if err != nil {
+		return err
 	}
 
 	if msg.header.Type == messageTypeResponse {

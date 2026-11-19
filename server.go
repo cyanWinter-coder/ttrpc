@@ -285,10 +285,11 @@ func (cs connState) String() string {
 
 func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 	c := &serverConn{
-		server:    s,
-		conn:      conn,
-		handshake: handshake,
-		shutdown:  make(chan struct{}),
+		server:       s,
+		conn:         conn,
+		handshake:    handshake,
+		streamPolicy: s.config.streamPolicy,
+		shutdown:     make(chan struct{}),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -299,10 +300,11 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 }
 
 type serverConn struct {
-	server    *Server
-	conn      net.Conn
-	handshake any // data from handshake, not used for now
-	state     atomic.Value
+	server       *Server
+	conn         net.Conn
+	handshake    any // data from handshake, not used for now
+	streamPolicy StreamBufferPolicy
+	state        atomic.Value
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
@@ -317,9 +319,14 @@ func (c *serverConn) setState(newstate connState) {
 	c.state.Store(newstate)
 }
 
+// close forces the connection down. Besides signalling the run loop it closes
+// the underlying connection, which unblocks any goroutine parked in a read or
+// write on a stalled peer. Without this an active connection could keep the
+// server (and every stream on it) alive indefinitely.
 func (c *serverConn) close() error {
 	c.shutdownOnce.Do(func() {
 		close(c.shutdown)
+		c.conn.Close()
 	})
 
 	return nil
@@ -337,21 +344,37 @@ func (c *serverConn) run(sctx context.Context) {
 	)
 
 	var (
-		ch                     = newChannel(c.conn)
-		ctx, cancel            = context.WithCancel(sctx)
-		state        connState = connStateIdle
-		responses              = make(chan response)
-		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
-		active       int32
-		lastStreamID uint32
+		ch                      = newChannel(c.conn)
+		ctx, cancel             = context.WithCancel(sctx)
+		state         connState = connStateIdle
+		responses               = make(chan response)
+		recvErr                 = make(chan error, 1)
+		done                    = make(chan struct{})
+		streams                 = sync.Map{} // stream ID -> *streamHandler
+		activeStreams           = sync.Map{} // stream IDs counted in active
+		active        int32
+		lastStreamID  uint32
 	)
 
 	defer c.conn.Close()
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer func() {
+		// Release every stream still registered for this connection. The
+		// connection context is cancelled by the deferred cancel above, which
+		// unblocks handlers, but their buffered messages would otherwise be
+		// retained until the handlers notice. Dropping them here bounds
+		// per-connection memory once the connection is gone. Responses queued
+		// by terminate are simply never sent because the send loop has exited.
+		streams.Range(func(_, value any) bool {
+			if sh, ok := value.(*streamHandler); ok {
+				sh.close()
+				sh.cancel()
+			}
+			return true
+		})
+	}()
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -409,13 +432,13 @@ func (c *serverConn) run(sctx context.Context) {
 
 			if mh.Type == messageTypeData {
 				i, ok := streams.Load(mh.StreamID)
-				if !ok {
+				sh, isStream := i.(*streamHandler)
+				if !ok || !isStream || sh == nil {
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID is no longer active")) {
 						return
 					}
 					continue
 				}
-				sh := i.(*streamHandler)
 				if mh.Flags&flagNoData != flagNoData {
 					unmarshal := func(obj any) error {
 						err := protoUnmarshal(p, obj)
@@ -423,10 +446,24 @@ func (c *serverConn) run(sctx context.Context) {
 						return err
 					}
 
-					if err := sh.data(unmarshal); err != nil {
-						if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "data handling error: %v", err)) {
-							return
+					if err := sh.data(ctx, unmarshal); err != nil {
+						// This stream can no longer accept data. Release what
+						// it buffered and unblock its handler instead of
+						// retaining payloads for the connection's lifetime.
+						sh.terminate()
+						streams.Delete(mh.StreamID)
+						if errors.Is(err, ErrStreamClosed) {
+							// The stream already ended, for example because
+							// its handler returned. Its terminal frame is
+							// authoritative, so drop the late data rather than
+							// report a second outcome for the same stream.
+							continue
 						}
+						// End the stream here so the handler cannot emit a
+						// second terminal frame for it later. The response is
+						// queued asynchronously to keep the receive loop
+						// moving for other streams.
+						sh.respond.terminateAsync(status.Newf(codes.InvalidArgument, "data handling error: %v", err))
 						continue
 					}
 				}
@@ -434,9 +471,12 @@ func (c *serverConn) run(sctx context.Context) {
 				if mh.Flags&flagRemoteClosed == flagRemoteClosed {
 					sh.closeSend()
 					if len(p) > 0 {
-						if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "data close message cannot include data")) {
-							return
-						}
+						// A close frame carrying data is a protocol error for
+						// this stream. End it through the handler's responder
+						// so it is the only terminal frame emitted for it.
+						sh.terminate()
+						streams.Delete(mh.StreamID)
+						sh.respond.terminateAsync(status.Newf(codes.InvalidArgument, "data close message cannot include data"))
 						continue
 					}
 				}
@@ -464,6 +504,13 @@ func (c *serverConn) run(sctx context.Context) {
 				ch.putmbuf(p)
 
 				id := mh.StreamID
+				// Count the stream before the handler can produce its
+				// terminal response, so the main loop can always match the
+				// response with exactly one decrement regardless of how
+				// quickly a handler finishes.
+				activeStreams.Store(id, struct{}{})
+				atomic.AddInt32(&active, 1)
+
 				respond := func(status *status.Status, data []byte, streaming, closeStream bool) error {
 					select {
 					case responses <- response{
@@ -478,17 +525,26 @@ func (c *serverConn) run(sctx context.Context) {
 					}
 					return nil
 				}
-				sh, err := c.server.services.handle(ctx, &req, respond)
+				sh, err := c.server.services.handle(ctx, id, &req, c.streamPolicy, respond)
+				if errors.Is(err, errStreamResponded) {
+					// The stream already queued its terminal response; the
+					// main loop accounts for it.
+					continue
+				}
 				if err != nil {
+					// The status response carries closeStream, so it releases
+					// the accounting entry stored above.
 					status, _ := status.FromError(err)
 					if !sendStatus(mh.StreamID, status) {
 						return
 					}
 					continue
 				}
-
-				streams.Store(id, sh)
-				atomic.AddInt32(&active, 1)
+				// A unary request has no stream handler; only register
+				// handlers which can receive further data on the stream.
+				if sh != nil {
+					streams.Store(id, sh)
+				}
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -546,9 +602,14 @@ func (c *serverConn) run(sctx context.Context) {
 			if response.closeStream {
 				// The ttrpc protocol currently does not support the case where
 				// the server is localClosed but not remoteClosed. Once the server
-				// is closing, the whole stream may be considered finished
+				// is closing, the whole stream may be considered finished.
 				streams.Delete(response.id)
-				atomic.AddInt32(&active, -1)
+				// Only streams which were actually counted when they started
+				// decrement the active count. A status response for an unknown
+				// or already finished stream ID must not drive it negative.
+				if _, ok := activeStreams.LoadAndDelete(response.id); ok {
+					atomic.AddInt32(&active, -1)
+				}
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this

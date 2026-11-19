@@ -29,6 +29,40 @@ It's recommended to use [`protobuild`](https://github.com/containerd/protobuild)
 to build the protobufs for this project, but this will work with protoc
 directly, if required.
 
+# Stream Backpressure
+
+Every stream owns a bounded receive buffer, so a slow consumer applies
+backpressure to its own stream instead of stalling the whole connection. A
+message which cannot be queued within the configured wait terminates only that
+stream with `ErrStreamFull`; other streams, unary calls, and the connection's
+receive loop keep making progress.
+
+The zero-value policy keeps the historical behavior (up to 64 buffered messages
+and a one second wait), so existing callers see no change. It can be tuned,
+made fail-fast, and observed on both the client and the server:
+
+```go
+policy := ttrpc.StreamBufferPolicy{
+	Capacity: 16,
+	FailFast: true, // fail the stream immediately instead of waiting
+	Observer: func(stats ttrpc.StreamBufferStats) {
+		log.Printf("stream %d queue %d/%d waits %d overflows %d",
+			stats.StreamID, stats.Queued, stats.Capacity, stats.Waits, stats.Overflows)
+	},
+}
+
+client := ttrpc.NewClient(conn, ttrpc.WithClientStreamBufferPolicy(policy))
+server, _ := ttrpc.NewServer(ttrpc.WithServerStreamBufferPolicy(policy))
+
+// Per-stream snapshots are also available on individual streams.
+if s, ok := stream.(ttrpc.StreamBufferStatser); ok {
+	stats := s.StreamBufferStats()
+}
+```
+
+The policy is entirely local: it never changes the wire protocol, so it is
+compatible with peers which do not configure one.
+
 # Differences from GRPC
 
 - The protocol stack has been replaced with a lighter protocol that doesn't

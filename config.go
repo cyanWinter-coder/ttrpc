@@ -22,8 +22,9 @@ import (
 )
 
 type serverConfig struct {
-	handshaker  Handshaker
-	interceptor UnaryServerInterceptor
+	handshaker   Handshaker
+	interceptor  UnaryServerInterceptor
+	streamPolicy StreamBufferPolicy
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -39,6 +40,20 @@ func WithServerHandshaker(handshaker Handshaker) ServerOpt {
 			return errors.New("only one handshaker allowed per server")
 		}
 		c.handshaker = handshaker
+		return nil
+	}
+}
+
+// WithServerStreamBufferPolicy configures per-stream receive buffering for
+// streams served by this server. The zero value keeps the default policy.
+//
+// The policy bounds how many messages are buffered per stream and how long the
+// connection's receive loop waits for a slow consumer before failing only that
+// stream with ErrStreamFull. It does not change the wire protocol, so it stays
+// compatible with peers which do not use it.
+func WithServerStreamBufferPolicy(policy StreamBufferPolicy) ServerOpt {
+	return func(c *serverConfig) error {
+		c.streamPolicy = policy
 		return nil
 	}
 }
