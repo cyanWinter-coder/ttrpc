@@ -265,21 +265,27 @@ func protoMarshal(obj any) ([]byte, error) {
 
 // convertCode maps stdlib go errors into grpc space.
 //
-// This is ripped from the grpc-go code base.
+// This is ripped from the grpc-go code base. Wrapped errors are recognized
+// through errors.Is so that, for example, a fmt.Errorf("%w", context.Canceled)
+// still maps to codes.Canceled instead of being reported as codes.Unknown.
 func convertCode(err error) codes.Code {
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		return codes.OK
-	case io.EOF:
-		return codes.OutOfRange
-	case io.ErrClosedPipe, io.ErrNoProgress, io.ErrShortBuffer, io.ErrShortWrite, io.ErrUnexpectedEOF:
-		return codes.FailedPrecondition
-	case os.ErrInvalid:
-		return codes.InvalidArgument
-	case context.Canceled:
+	case errors.Is(err, context.Canceled):
 		return codes.Canceled
-	case context.DeadlineExceeded:
+	case errors.Is(err, context.DeadlineExceeded):
 		return codes.DeadlineExceeded
+	case errors.Is(err, io.EOF):
+		return codes.OutOfRange
+	case errors.Is(err, io.ErrClosedPipe),
+		errors.Is(err, io.ErrNoProgress),
+		errors.Is(err, io.ErrShortBuffer),
+		errors.Is(err, io.ErrShortWrite),
+		errors.Is(err, io.ErrUnexpectedEOF):
+		return codes.FailedPrecondition
+	case errors.Is(err, os.ErrInvalid):
+		return codes.InvalidArgument
 	}
 	switch {
 	case os.IsExist(err):

@@ -179,7 +179,9 @@ func (c *Client) Call(ctx context.Context, service, method string, req, resp any
 	}
 
 	if cresp.Status != nil && cresp.Status.Code != int32(codes.OK) {
-		return status.ErrorProto(cresp.Status)
+		// Rebuild the typed error from the wire status so code, message and
+		// structured details are all available to the caller.
+		return statusErrorFromProto(cresp.Status)
 	}
 	return nil
 }
@@ -257,13 +259,16 @@ func (cs *clientStream) RecvMsg(m any) error {
 	var msg *streamMessage
 	select {
 	case <-cs.ctx.Done():
-		return cs.ctx.Err()
+		// Local request cancellation (or the caller's deadline) is reported as
+		// a status while errors.Is(err, context.Canceled) keeps working
+		// through the preserved cause.
+		return mapStatusError(cs.ctx.Err())
 	case <-cs.s.recvClose:
 		// If recv has a pending message, process that first
 		select {
 		case msg = <-cs.s.recv:
 		default:
-			return cs.s.recvErr
+			return mapStatusError(cs.s.recvErr)
 		}
 	case msg = <-cs.s.recv:
 	}
@@ -278,12 +283,18 @@ func (cs *clientStream) RecvMsg(m any) error {
 			return err
 		}
 
-		if err := cs.c.codec.Unmarshal(resp.Payload, m); err != nil {
-			return err
+		// A terminal response carries the server's final status. Evaluate it
+		// before touching the payload so a failed stream (which may have no
+		// decodable payload) always surfaces the server status instead of an
+		// unrelated unmarshal error.
+		if resp.Status != nil && resp.Status.Code != int32(codes.OK) {
+			cs.c.deleteStream(cs.s)
+			cs.remoteClosed = true
+			return statusErrorFromProto(resp.Status)
 		}
 
-		if resp.Status != nil && resp.Status.Code != int32(codes.OK) {
-			return status.ErrorProto(resp.Status)
+		if err := cs.c.codec.Unmarshal(resp.Payload, m); err != nil {
+			return err
 		}
 
 		cs.c.deleteStream(cs.s)
@@ -460,7 +471,10 @@ func (c *Client) cleanupStreams(err error) {
 // filterCloseErr rewrites EOF and EPIPE errors to ErrClosed. Use when
 // returning from call or handling errors from main read loop.
 //
-// This purposely ignores errors with a wrapped cause.
+// This purposely ignores errors with a wrapped cause. Transport failures that
+// do not match one of the explicit rewrites below are converted to a
+// codes.Unavailable StatusError which keeps the original error as its
+// diagnostic cause; application and protocol errors are returned untouched.
 func filterCloseErr(err error) error {
 	switch {
 	case err == nil:
@@ -481,6 +495,9 @@ func filterCloseErr(err error) error {
 				(oerr.Op == "read" && errors.Is(err, syscall.ECONNRESET)) {
 				return ErrClosed
 			}
+			// Any other transport-level failure maps to Unavailable while the
+			// underlying net error stays reachable through errors.As/Is.
+			return transportStatusError(err)
 		}
 	}
 
@@ -545,7 +562,7 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 	var msg *streamMessage
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return mapStatusError(ctx.Err())
 	case <-c.ctx.Done():
 		return ErrClosed
 	case <-s.recvClose:
@@ -553,7 +570,7 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 		select {
 		case msg = <-s.recv:
 		default:
-			return s.recvErr
+			return mapStatusError(s.recvErr)
 		}
 	case msg = <-s.recv:
 	}

@@ -28,8 +28,10 @@ var (
 	ErrProtocol = errors.New("protocol error")
 
 	// ErrClosed is returned by client methods when the underlying connection is
-	// closed.
-	ErrClosed = errors.New("ttrpc: closed")
+	// closed. It also carries a codes.Unavailable status so status.Code and
+	// status.FromError classify connection failures distinctly from request
+	// cancellation and server-side deadlines.
+	ErrClosed error = &codedError{code: codes.Unavailable, msg: "ttrpc: closed"}
 
 	// ErrServerClosed is returned when the Server has closed its connection.
 	ErrServerClosed = errors.New("ttrpc: server closed")
@@ -41,8 +43,13 @@ var (
 	// and the message cannot be delivered without blocking the
 	// connection's receive loop. This prevents a single unconsumed
 	// stream from deadlocking all other streams on the same connection.
-	ErrStreamFull = errors.New("ttrpc: stream buffer full")
+	// It carries a codes.ResourceExhausted status.
+	ErrStreamFull error = &codedError{code: codes.ResourceExhausted, msg: "ttrpc: stream buffer full"}
 )
+
+// Compile-time assertion that the status-aware sentinel implementation is
+// accepted by the grpc/status helpers.
+var _ interface{ GRPCStatus() *status.Status } = (*codedError)(nil)
 
 // OversizedMessageErr is used to indicate refusal to send an oversized message.
 // It wraps a ResourceExhausted grpc Status together with the offending message
