@@ -48,20 +48,27 @@ var (
 // It wraps a ResourceExhausted grpc Status together with the offending message
 // length.
 type OversizedMessageErr struct {
-	messageLength int
-	err           error
+	messageLength    int
+	messageLengthMax int
+	err              error
 }
 
 // OversizedMessageError returns an OversizedMessageErr error for the given message
 // length if it exceeds the allowed maximum. Otherwise a nil error is returned.
 func OversizedMessageError(messageLength int) error {
+	return oversizedMessageError(messageLength, messageLengthMax)
+}
+
+// oversizedMessageError is OversizedMessageError with a configurable maximum.
+func oversizedMessageError(messageLength, messageLengthMax int) error {
 	if messageLength <= messageLengthMax {
 		return nil
 	}
 
 	return &OversizedMessageErr{
-		messageLength: messageLength,
-		err:           status.Errorf(codes.ResourceExhausted, "message length %v exceed maximum message size of %v", messageLength, messageLengthMax),
+		messageLength:    messageLength,
+		messageLengthMax: messageLengthMax,
+		err:              status.Errorf(codes.ResourceExhausted, "message length %v exceed maximum message size of %v", messageLength, messageLengthMax),
 	}
 }
 
@@ -81,6 +88,6 @@ func (e *OversizedMessageErr) RejectedLength() int {
 }
 
 // MaximumLength retrieves the maximum allowed message length that triggered the error.
-func (*OversizedMessageErr) MaximumLength() int {
-	return messageLengthMax
+func (e *OversizedMessageErr) MaximumLength() int {
+	return e.messageLengthMax
 }

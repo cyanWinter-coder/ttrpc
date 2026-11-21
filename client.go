@@ -52,6 +52,8 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+
+	mlen uint32
 }
 
 // ClientOpts configures a client
@@ -68,6 +70,15 @@ func WithOnClose(onClose func()) ClientOpts {
 func WithUnaryClientInterceptor(i UnaryClientInterceptor) ClientOpts {
 	return func(c *Client) {
 		c.interceptor = i
+	}
+}
+
+// WithClientMessageLengthMax sets the maximum message length, in bytes,
+// that the client sends and accepts on its connection. A zero value selects
+// the default maximum message size.
+func WithClientMessageLengthMax(mlen uint32) ClientOpts {
+	return func(c *Client) {
+		c.mlen = mlen
 	}
 }
 
@@ -110,11 +121,9 @@ func chainUnaryInterceptors(interceptors []UnaryClientInterceptor, final Invoker
 // NewClient creates a new ttrpc client using the given connection
 func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
-	channel := newChannel(conn)
 	c := &Client{
 		codec:           codec{},
 		conn:            conn,
-		channel:         channel,
 		streams:         make(map[streamID]*stream),
 		nextStreamID:    1,
 		closed:          cancel,
@@ -126,6 +135,8 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 	for _, o := range opts {
 		o(c)
 	}
+
+	c.channel = newChannelWithMessageLengthMax(conn, c.mlen)
 
 	if c.interceptor == nil {
 		c.interceptor = defaultClientInterceptor
@@ -321,7 +332,7 @@ func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed()
 
-		c.conn.Close()
+		c.channel.close()
 	})
 	return nil
 }

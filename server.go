@@ -337,7 +337,7 @@ func (c *serverConn) run(sctx context.Context) {
 	)
 
 	var (
-		ch                     = newChannel(c.conn)
+		ch                     = newChannelWithMessageLengthMax(c.conn, c.server.config.mlen)
 		ctx, cancel            = context.WithCancel(sctx)
 		state        connState = connStateIdle
 		responses              = make(chan response)
@@ -348,7 +348,7 @@ func (c *serverConn) run(sctx context.Context) {
 		lastStreamID uint32
 	)
 
-	defer c.conn.Close()
+	defer ch.close()
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
@@ -494,6 +494,52 @@ func (c *serverConn) run(sctx context.Context) {
 		}
 	}(recvErr)
 
+	// sendUnaryResponse marshals and sends a terminal response for a single
+	// request. A request whose response fails to encode, or exceeds the
+	// maximum message size, is failed on its own with an error status so the
+	// other in-flight requests on the connection are unaffected. It returns
+	// false only when the connection itself is broken and the serve loop
+	// must exit.
+	sendUnaryResponse := func(id uint32, st *status.Status, data []byte) bool {
+		p, err := c.server.codec.Marshal(&Response{
+			Status:  st.Proto(),
+			Payload: data,
+		})
+		if err != nil {
+			log.G(ctx).WithError(err).Error("failed marshaling response")
+			p, err = c.server.codec.Marshal(&Response{
+				Status: status.Newf(codes.Internal, "ttrpc: failed to marshal response: %v", err).Proto(),
+			})
+			if err != nil {
+				log.G(ctx).WithError(err).Error("failed marshaling error response")
+				return false
+			}
+		}
+
+		if err := ch.send(id, messageTypeResponse, 0, p); err != nil {
+			var oerr *OversizedMessageErr
+			if !errors.As(err, &oerr) {
+				log.G(ctx).WithError(err).Error("failed sending message on channel")
+				return false
+			}
+			// The response exceeded the maximum message size: fail just
+			// this request and keep serving the others.
+			log.G(ctx).WithError(err).Error("response exceeds maximum message size")
+			p, err = c.server.codec.Marshal(&Response{
+				Status: status.Newf(codes.ResourceExhausted, "ttrpc: response size %v exceeds maximum message size of %v", oerr.RejectedLength(), oerr.MaximumLength()).Proto(),
+			})
+			if err != nil {
+				log.G(ctx).WithError(err).Error("failed marshaling oversized response error")
+				return false
+			}
+			if err := ch.send(id, messageTypeResponse, 0, p); err != nil {
+				log.G(ctx).WithError(err).Error("failed sending message on channel")
+				return false
+			}
+		}
+		return true
+	}
+
 	for {
 		var (
 			newstate connState
@@ -516,17 +562,7 @@ func (c *serverConn) run(sctx context.Context) {
 		select {
 		case response := <-responses:
 			if !response.streaming || response.status.Code() != codes.OK {
-				p, err := c.server.codec.Marshal(&Response{
-					Status:  response.status.Proto(),
-					Payload: response.data,
-				})
-				if err != nil {
-					log.G(ctx).WithError(err).Error("failed marshaling response")
-					return
-				}
-
-				if err := ch.send(response.id, messageTypeResponse, 0, p); err != nil {
-					log.G(ctx).WithError(err).Error("failed sending message on channel")
+				if !sendUnaryResponse(response.id, response.status, response.data) {
 					return
 				}
 			} else {
@@ -538,8 +574,19 @@ func (c *serverConn) run(sctx context.Context) {
 					flags = flags | flagNoData
 				}
 				if err := ch.send(response.id, messageTypeData, flags, response.data); err != nil {
-					log.G(ctx).WithError(err).Error("failed sending message on channel")
-					return
+					var oerr *OversizedMessageErr
+					if !errors.As(err, &oerr) {
+						log.G(ctx).WithError(err).Error("failed sending message on channel")
+						return
+					}
+					// A single oversized stream message must not take down
+					// the connection: terminate just this stream with an
+					// error status and keep serving the others.
+					log.G(ctx).WithError(err).Error("stream message exceeds maximum message size")
+					if !sendUnaryResponse(response.id, status.Newf(codes.ResourceExhausted, "ttrpc: message size %v exceeds maximum message size of %v", oerr.RejectedLength(), oerr.MaximumLength()), nil) {
+						return
+					}
+					response.closeStream = true
 				}
 			}
 
@@ -561,7 +608,10 @@ func (c *serverConn) run(sctx context.Context) {
 				return
 			}
 			log.G(ctx).WithError(err).Error("error receiving message")
-			// else, initiate shutdown
+			// else, initiate shutdown: in-flight requests are drained and
+			// anything still waiting on this connection is woken up once it
+			// goes idle.
+			c.close()
 		case <-shutdown:
 			return
 		}

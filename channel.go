@@ -83,31 +83,61 @@ func readMessageHeader(p []byte, r io.Reader) (messageHeader, error) {
 	}, nil
 }
 
-func writeMessageHeader(w io.Writer, p []byte, mh messageHeader) error {
+// writeMessageHeader serializes mh into p, which must be at least
+// messageHeaderLength bytes long.
+func writeMessageHeader(p []byte, mh messageHeader) {
 	binary.BigEndian.PutUint32(p[:4], mh.Length)
 	binary.BigEndian.PutUint32(p[4:8], mh.StreamID)
 	p[8] = byte(mh.Type)
 	p[9] = mh.Flags
-
-	_, err := w.Write(p[:])
-	return err
 }
 
 var buffers sync.Pool
 
 type channel struct {
-	conn  net.Conn
-	bw    *bufio.Writer
-	br    *bufio.Reader
+	conn net.Conn
+	br   *bufio.Reader
+
 	hrbuf [messageHeaderLength]byte // avoid alloc when reading header
-	hwbuf [messageHeaderLength]byte
+
+	// mlen is the maximum message length accepted on this channel. It is
+	// validated before any buffer is allocated for an incoming frame.
+	mlen uint32
+
+	// wbuf is a scratch buffer used to assemble outgoing frames.
+	wbuf []byte
+	// wpending holds the unwritten remainder of a frame whose write only
+	// partially succeeded. It records the real write progress so a later
+	// send resumes at the correct offset instead of re-writing the frame
+	// prefix.
+	wpending []byte
+
+	// recvErr is the terminal receive error. Once set, the connection can
+	// no longer be framed and recv reports the same error again without
+	// touching the connection, so residual bytes are never parsed as a new
+	// frame.
+	recvErr error
+
+	closeOnce sync.Once
+	closed    chan struct{}
+	closeErr  error
 }
 
 func newChannel(conn net.Conn) *channel {
+	return newChannelWithMessageLengthMax(conn, messageLengthMax)
+}
+
+// newChannelWithMessageLengthMax creates a channel which rejects messages
+// larger than mlen. A zero mlen selects the default maximum message size.
+func newChannelWithMessageLengthMax(conn net.Conn, mlen uint32) *channel {
+	if mlen == 0 {
+		mlen = messageLengthMax
+	}
 	return &channel{
-		conn: conn,
-		bw:   bufio.NewWriter(conn),
-		br:   bufio.NewReader(conn),
+		conn:   conn,
+		br:     bufio.NewReader(conn),
+		mlen:   mlen,
+		closed: make(chan struct{}),
 	}
 }
 
@@ -115,27 +145,48 @@ func newChannel(conn net.Conn) *channel {
 //
 // If a valid grpc status is returned, the message header
 // returned will be valid and caller should send that along to
-// the correct consumer. The bytes on the underlying channel
-// will be discarded.
+// the correct consumer. The connection is poisoned in that case: the
+// declared frame is not consumed and no further messages can be received.
 func (ch *channel) recv() (messageHeader, []byte, error) {
+	if ch.recvErr != nil {
+		return messageHeader{}, nil, ch.recvErr
+	}
+
+	select {
+	case <-ch.closed:
+		return messageHeader{}, nil, ErrClosed
+	default:
+	}
+
 	mh, err := readMessageHeader(ch.hrbuf[:], ch.br)
 	if err != nil {
+		// A truncated or corrupt header means the connection can no longer
+		// be framed. Stop parsing instead of treating leftover bytes as the
+		// start of a new frame.
+		ch.recvErr = err
 		return messageHeader{}, nil, err
 	}
 
-	if mh.Length > uint32(messageLengthMax) {
-		if _, err := ch.br.Discard(int(mh.Length)); err != nil {
-			return mh, nil, fmt.Errorf("failed to discard after receiving oversized message: %w", err)
-		}
-
-		return mh, nil, status.Errorf(codes.ResourceExhausted, "message length %v exceed maximum message size of %v", mh.Length, messageLengthMax)
+	if mh.Length > ch.mlen {
+		// The declared length exceeds what we are willing to allocate.
+		// Do not allocate for it and do not try to discard the body: the
+		// peer may never send that many bytes, which would wedge the read
+		// loop on a half-frame and stall every other request on the
+		// connection. Report the message as oversized, then poison the
+		// channel so residual bytes are never parsed as a new frame.
+		ch.recvErr = fmt.Errorf("ttrpc: %w: message length %v exceeds maximum message size of %v", ErrProtocol, mh.Length, ch.mlen)
+		return mh, nil, status.Errorf(codes.ResourceExhausted, "message length %v exceed maximum message size of %v", mh.Length, ch.mlen)
 	}
 
 	var p []byte
 	if mh.Length > 0 {
 		p = ch.getmbuf(int(mh.Length))
 		if _, err := io.ReadFull(ch.br, p); err != nil {
-			return messageHeader{}, nil, fmt.Errorf("failed reading message: %w", err)
+			// Truncated frame: release the frame buffer and stop parsing
+			// this connection.
+			ch.putmbuf(p)
+			ch.recvErr = fmt.Errorf("failed reading message: %w", err)
+			return messageHeader{}, nil, ch.recvErr
 		}
 	}
 
@@ -143,22 +194,80 @@ func (ch *channel) recv() (messageHeader, []byte, error) {
 }
 
 func (ch *channel) send(streamID uint32, t messageType, flags uint8, p []byte) error {
-	if len(p) > messageLengthMax {
-		return OversizedMessageError(len(p))
+	select {
+	case <-ch.closed:
+		return ErrClosed
+	default:
 	}
 
-	if err := writeMessageHeader(ch.bw, ch.hwbuf[:], messageHeader{Length: uint32(len(p)), StreamID: streamID, Type: t, Flags: flags}); err != nil {
+	if len(p) > int(ch.mlen) {
+		return oversizedMessageError(len(p), int(ch.mlen))
+	}
+
+	// A previous frame may have been partially written. Finish writing it
+	// before starting a new frame so frames stay ordered and no prefix is
+	// written twice.
+	if err := ch.flushPending(); err != nil {
 		return err
 	}
 
-	if len(p) > 0 {
-		_, err := ch.bw.Write(p)
+	need := messageHeaderLength + len(p)
+	if cap(ch.wbuf) < need {
+		ch.wbuf = make([]byte, need)
+	}
+	frame := ch.wbuf[:need]
+	writeMessageHeader(frame, messageHeader{Length: uint32(len(p)), StreamID: streamID, Type: t, Flags: flags})
+	copy(frame[messageHeaderLength:], p)
+
+	return ch.writeAll(frame)
+}
+
+// writeAll writes p completely. If the connection fails after accepting only
+// part of p, the unwritten remainder is recorded in ch.wpending so the next
+// send resumes at the real offset.
+func (ch *channel) writeAll(p []byte) error {
+	for len(p) > 0 {
+		n, err := ch.conn.Write(p)
+		if n > 0 {
+			p = p[n:]
+		}
 		if err != nil {
+			if len(p) > 0 {
+				ch.wpending = append(ch.wpending[:0], p...)
+			}
 			return err
 		}
 	}
+	return nil
+}
 
-	return ch.bw.Flush()
+// flushPending completes any partially written frame from a previous send.
+func (ch *channel) flushPending() error {
+	p := ch.wpending
+	for len(p) > 0 {
+		n, err := ch.conn.Write(p)
+		if n > 0 {
+			p = p[n:]
+		}
+		if err != nil {
+			ch.wpending = append(ch.wpending[:0], p...)
+			return err
+		}
+	}
+	ch.wpending = ch.wpending[:0]
+	return nil
+}
+
+// close shuts down the channel and the underlying connection, waking any
+// blocked senders and receivers. It is safe to call multiple times; the
+// underlying connection is closed at most once and every caller observes the
+// same close error.
+func (ch *channel) close() error {
+	ch.closeOnce.Do(func() {
+		close(ch.closed)
+		ch.closeErr = ch.conn.Close()
+	})
+	return ch.closeErr
 }
 
 func (ch *channel) getmbuf(size int) []byte {

@@ -24,6 +24,7 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+	mlen        uint32
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -39,6 +40,21 @@ func WithServerHandshaker(handshaker Handshaker) ServerOpt {
 			return errors.New("only one handshaker allowed per server")
 		}
 		c.handshaker = handshaker
+		return nil
+	}
+}
+
+// WithServerMessageLengthMax sets the maximum message length, in bytes,
+// that the server accepts on a connection. Messages larger than the limit
+// are rejected with a ResourceExhausted status before any buffer is
+// allocated for them, and the offending connection is no longer parsed.
+// A zero value selects the default maximum message size.
+func WithServerMessageLengthMax(mlen uint32) ServerOpt {
+	return func(c *serverConfig) error {
+		if c.mlen != 0 {
+			return errors.New("only one message length max allowed per server")
+		}
+		c.mlen = mlen
 		return nil
 	}
 }
