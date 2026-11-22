@@ -24,6 +24,9 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+
+	capturePeerCredentials PeerCredentialsCaptureFunc
+	verifyPeerCredentials  PeerCredentialsVerifierFunc
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -50,6 +53,53 @@ func WithUnaryServerInterceptor(i UnaryServerInterceptor) ServerOpt {
 			return errors.New("only one unchained interceptor allowed per server")
 		}
 		c.interceptor = i
+		return nil
+	}
+}
+
+// WithUnixPeerCredentials makes the server capture the Unix domain socket
+// peer credentials (effective UID, GID and PID) of every accepted connection
+// exactly once, at accept time.
+//
+// The captured snapshot is frozen for the lifetime of the connection and is
+// attached to the context passed to handlers and interceptors, where it can be
+// read with PeerCredentialsFromContext. It is also validated with verify, if
+// non-nil, before any request on the connection is served; a verification
+// error rejects the connection. Capture errors, missing credentials, truncated
+// or unsupported credentials are always fatal for the connection: the server
+// never serves a connection whose credentials could not be established, so a
+// peer can never be treated as anonymous by accident.
+//
+// Credentials are Linux-specific. On other platforms connections are rejected
+// with ErrPeerCredentialsUnsupported.
+func WithUnixPeerCredentials(verify PeerCredentialsVerifierFunc) ServerOpt {
+	return func(c *serverConfig) error {
+		if c.capturePeerCredentials != nil {
+			return errors.New("peer credentials capture already configured")
+		}
+		c.capturePeerCredentials = captureUnixPeerCredentials
+		c.verifyPeerCredentials = verify
+		return nil
+	}
+}
+
+// WithPeerCredentialsCapture configures a custom capture function for peer
+// credentials. It is the platform-independent counterpart of
+// WithUnixPeerCredentials and lets a server bind credentials from another
+// transport, such as TLS, to each connection.
+//
+// The function is called exactly once per accepted connection. Errors reject
+// the connection.
+func WithPeerCredentialsCapture(capture PeerCredentialsCaptureFunc, verify PeerCredentialsVerifierFunc) ServerOpt {
+	return func(c *serverConfig) error {
+		if c.capturePeerCredentials != nil {
+			return errors.New("peer credentials capture already configured")
+		}
+		if capture == nil {
+			return errors.New("peer credentials capture must not be nil")
+		}
+		c.capturePeerCredentials = capture
+		c.verifyPeerCredentials = verify
 		return nil
 	}
 }

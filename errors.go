@@ -42,6 +42,27 @@ var (
 	// connection's receive loop. This prevents a single unconsumed
 	// stream from deadlocking all other streams on the same connection.
 	ErrStreamFull = errors.New("ttrpc: stream buffer full")
+
+	// ErrPeerCredentialsUnavailable is returned when a connection's peer
+	// credentials could not be established, for example because the
+	// connection is not a Unix socket or the SO_PEERCRED lookup failed.
+	// The server rejects such a connection instead of serving it as an
+	// anonymous peer.
+	ErrPeerCredentialsUnavailable = errors.New("ttrpc: peer credentials unavailable")
+
+	// ErrPeerCredentialsTruncated is returned when the operating system
+	// reports fewer credential bytes than expected. Short credentials are
+	// an error, never a valid zeroed identity.
+	ErrPeerCredentialsTruncated = errors.New("ttrpc: peer credentials truncated")
+
+	// ErrPeerCredentialsUnsupported is returned when peer credentials are
+	// requested on a platform without an implementation. Connections are
+	// rejected rather than served anonymously.
+	ErrPeerCredentialsUnsupported = errors.New("ttrpc: peer credentials unsupported on this platform")
+
+	// ErrPeerCredentialsRejected is returned when the server's credential
+	// verifier rejects a connection's frozen credentials.
+	ErrPeerCredentialsRejected = errors.New("ttrpc: peer credentials rejected")
 )
 
 // OversizedMessageErr is used to indicate refusal to send an oversized message.

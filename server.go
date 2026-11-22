@@ -19,6 +19,7 @@ package ttrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -41,6 +42,15 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+
+	// connGen assigns each accepted connection a generation number. It is
+	// never reset, so a reconnect from the same process always receives a
+	// fresh identity, and a closed connection can never release the
+	// credentials of a newer one.
+	connGen uint64
+	// credentials holds the frozen credential snapshot for every live
+	// connection, keyed by generation.
+	credentials *credentialCache
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -60,6 +70,7 @@ func NewServer(opts ...ServerOpt) (*Server, error) {
 		done:        make(chan struct{}),
 		listeners:   make(map[net.Listener]struct{}),
 		connections: make(map[*serverConn]struct{}),
+		credentials: newCredentialCache(),
 	}, nil
 }
 
@@ -126,6 +137,18 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 
 		backoff = 0
 
+		// Capture credentials before the handshake and before anything is
+		// read from the connection. The snapshot is frozen for the
+		// lifetime of this connection: later requests, including ones on
+		// a reused connection, can never observe a different peer's
+		// credentials.
+		creds, haveCreds, err := s.captureCredentials(conn)
+		if err != nil {
+			log.G(ctx).WithError(err).Error("ttrpc: refusing connection; peer credentials could not be established")
+			conn.Close()
+			continue
+		}
+
 		approved, handshake, err := handshaker.Handshake(ctx, conn)
 		if err != nil {
 			log.G(ctx).WithError(err).Error("ttrpc: refusing connection after handshake")
@@ -133,7 +156,22 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 			continue
 		}
 
-		sc, err := s.newConn(approved, handshake)
+		if !haveCreds {
+			// A handshaker may capture credentials itself (for example
+			// the historical UnixSocketRequire* handshakers). Freeze
+			// whatever it returned against this connection now.
+			creds, haveCreds = peerCredentialsFromHandshake(handshake)
+		}
+
+		if haveCreds {
+			if err := s.verifyCredentials(creds); err != nil {
+				log.G(ctx).WithError(err).Error("ttrpc: refusing connection; peer credentials rejected")
+				conn.Close()
+				continue
+			}
+		}
+
+		sc, err := s.newConn(approved, handshake, creds, haveCreds)
 		if err != nil {
 			log.G(ctx).WithError(err).Error("ttrpc: create connection failed")
 			conn.Close()
@@ -142,6 +180,48 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 
 		go sc.run(ctx)
 	}
+}
+
+// captureCredentials establishes the frozen peer credentials for a newly
+// accepted connection, before anything is read from it.
+//
+// The credential source is the configured capture function. When none is
+// configured, the handshaker may still supply credentials, which are frozen
+// once the handshake completes (see peerCredentialsFromHandshake). A capture
+// error is terminal for the connection: the peer is rejected instead of being
+// served with an anonymous identity.
+func (s *Server) captureCredentials(conn net.Conn) (PeerCredentials, bool, error) {
+	if s.config.capturePeerCredentials == nil {
+		return PeerCredentials{}, false, nil
+	}
+
+	creds, err := s.config.capturePeerCredentials(conn)
+	if err != nil {
+		return PeerCredentials{}, false, err
+	}
+	return creds, true, nil
+}
+
+// nextGeneration returns a new, never reused connection generation.
+func (s *Server) nextGeneration() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.connGen++
+	return s.connGen
+}
+
+// verifyCredentials runs the configured credential verifier, if any, against
+// the frozen snapshot. A verifier error rejects the connection before it is
+// served.
+func (s *Server) verifyCredentials(creds PeerCredentials) error {
+	if s.config.verifyPeerCredentials == nil {
+		return nil
+	}
+	if err := s.config.verifyPeerCredentials(creds); err != nil {
+		return fmt.Errorf("%w: %v", ErrPeerCredentialsRejected, err)
+	}
+	return nil
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -190,6 +270,7 @@ func (s *Server) Close() error {
 	for c := range s.connections {
 		c.close()
 		delete(s.connections, c)
+		c.releaseCredentials()
 	}
 
 	return err
@@ -239,7 +320,13 @@ func (s *Server) delConnection(c *serverConn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, ok := s.connections[c]; !ok {
+		// Another path already retired this connection; leave its
+		// credential entry to that path, which releases exactly once.
+		return
+	}
 	delete(s.connections, c)
+	c.releaseCredentials()
 }
 
 func (s *Server) countConnection() int {
@@ -259,6 +346,7 @@ func (s *Server) closeIdleConns() {
 		}
 		c.close()
 		delete(s.connections, c)
+		c.releaseCredentials()
 	}
 }
 
@@ -283,15 +371,26 @@ func (cs connState) String() string {
 	}
 }
 
-func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
+func (s *Server) newConn(conn net.Conn, handshake any, creds PeerCredentials, haveCreds bool) (*serverConn, error) {
 	c := &serverConn{
 		server:    s,
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
 	}
+	if haveCreds {
+		// Stamp the frozen snapshot with a fresh, never reused
+		// generation and register it before any request can be read.
+		creds.ConnectionID = s.nextGeneration()
+		c.creds = creds
+		c.haveCreds = true
+		s.credentials.add(creds)
+	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
+		// The connection will never run, so release its credential
+		// entry here; run's deferred release will never fire.
+		c.releaseCredentials()
 		c.close()
 		return nil, err
 	}
@@ -304,8 +403,28 @@ type serverConn struct {
 	handshake any // data from handshake, not used for now
 	state     atomic.Value
 
+	// creds is the immutable credential snapshot captured for this
+	// connection, and haveCreds reports whether one was established.
+	creds     PeerCredentials
+	haveCreds bool
+
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	releaseOnce sync.Once
+}
+
+// releaseCredentials drops this connection's credential entry. It is idempotent:
+// whichever of the connection teardown paths runs first performs the release,
+// and later ones are no-ops. Release is keyed by this connection's generation,
+// so an older connection can never remove the entry of a newer connection
+// opened by the same process.
+func (c *serverConn) releaseCredentials() {
+	c.releaseOnce.Do(func() {
+		if c.haveCreds {
+			c.server.credentials.remove(c.creds.ConnectionID)
+		}
+	})
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -347,6 +466,14 @@ func (c *serverConn) run(sctx context.Context) {
 		active       int32
 		lastStreamID uint32
 	)
+
+	// Bind the connection's frozen credential snapshot to the context every
+	// request on this connection is served with. The snapshot is read from
+	// this connection's own field, so it cannot change while the connection
+	// lives, and a request on another connection can never observe it.
+	if c.haveCreds {
+		ctx = WithPeerCredentials(ctx, c.creds)
+	}
 
 	defer c.conn.Close()
 	defer cancel()
