@@ -37,6 +37,13 @@ type stream struct {
 	closeOnce sync.Once
 	recvErr   error
 	recvClose chan struct{}
+
+	// onClose, if set, is invoked exactly once when the stream is closed,
+	// from within closeWithError. The client uses it to release
+	// per-request resources (such as a concurrency slot) no matter which
+	// path retires the stream: normal completion, cancellation, a full
+	// receive buffer, or connection teardown.
+	onClose func()
 }
 
 func newStream(id streamID, send sender, recvBuf int) *stream {
@@ -56,6 +63,9 @@ func (s *stream) closeWithError(err error) error {
 			s.recvErr = ErrClosed
 		}
 		close(s.recvClose)
+		if s.onClose != nil {
+			s.onClose()
+		}
 	})
 	return nil
 }

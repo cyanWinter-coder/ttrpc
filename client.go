@@ -44,6 +44,11 @@ type Client struct {
 	nextStreamID streamID
 	sendLock     sync.Mutex
 
+	// slots bounds the number of in-flight requests (unary calls and
+	// streams) on this connection. A nil channel means unbounded, which
+	// is the default and preserves the historical behavior.
+	slots chan struct{}
+
 	ctx    context.Context
 	closed func()
 
@@ -68,6 +73,20 @@ func WithOnClose(onClose func()) ClientOpts {
 func WithUnaryClientInterceptor(i UnaryClientInterceptor) ClientOpts {
 	return func(c *Client) {
 		c.interceptor = i
+	}
+}
+
+// WithMaxConcurrentRequests limits the number of requests (unary calls and
+// streams) that may be in flight on the client connection at the same time.
+// Once the limit is reached, new requests block until a slot is released by
+// a request that completes, is cancelled, or times out, making backpressure
+// visible to callers through their own context deadlines. A value <= 0 (the
+// default) means no limit.
+func WithMaxConcurrentRequests(n int) ClientOpts {
+	return func(c *Client) {
+		if n > 0 {
+			c.slots = make(chan struct{}, n)
+		}
 	}
 }
 
@@ -369,7 +388,15 @@ func (c *Client) receiveLoop() error {
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
-				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
+				// The request that owned this stream has completed or
+				// been cancelled, so this frame is late. It has already
+				// been read in full, keeping the connection framed
+				// correctly; discard it without delivering it to any
+				// other request.
+				log.G(c.ctx).WithField("stream", sid).Debug("ttrpc: discarding message on inactive stream")
+				if msg.payload != nil {
+					c.channel.putmbuf(msg.payload)
+				}
 				continue
 			}
 
@@ -378,6 +405,9 @@ func (c *Client) receiveLoop() error {
 			} else {
 				if err := s.receive(c.ctx, msg); err != nil {
 					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
+					if msg.payload != nil {
+						c.channel.putmbuf(msg.payload)
+					}
 				}
 			}
 		}
@@ -386,7 +416,15 @@ func (c *Client) receiveLoop() error {
 
 // createStream creates a new stream and registers it with the client
 // Introduce stream types for multiple or single response
-func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, error) {
+func (c *Client) createStream(ctx context.Context, flags uint8, b []byte, recvBuf int) (*stream, error) {
+	// Acquire a concurrency slot before anything else so that
+	// backpressure is visible to the caller's context. The slot is bound
+	// to the stream's close below, so it is released exactly once no
+	// matter how the request ends.
+	if err := c.acquireSlot(ctx); err != nil {
+		return nil, err
+	}
+
 	// sendLock must be held across both allocation of the stream ID and sending it across the wire.
 	// This ensures that new stream IDs sent on the wire are always increasing, which is a
 	// requirement of the TTRPC protocol.
@@ -399,6 +437,7 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	// anything after cleanup completes
 	select {
 	case <-c.ctx.Done():
+		c.releaseSlot()
 		return nil, ErrClosed
 	default:
 	}
@@ -418,19 +457,49 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		}
 
 		s = newStream(c.nextStreamID, c, recvBuf)
+		s.onClose = c.releaseSlot
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
 
 		return nil
 	}(); err != nil {
+		c.releaseSlot()
 		return nil, err
 	}
 
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
-		return s, filterCloseErr(err)
+		// The request never reached the server; retire the stream so it
+		// does not linger in the registry and its slot is released.
+		c.deleteStream(s)
+		return nil, filterCloseErr(err)
 	}
 
 	return s, nil
+}
+
+// acquireSlot blocks until a concurrency slot is available, the caller's
+// context is done, or the client is closed. It is a no-op when no limit
+// is configured.
+func (c *Client) acquireSlot(ctx context.Context) error {
+	if c.slots == nil {
+		return nil
+	}
+	select {
+	case c.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return ErrClosed
+	}
+}
+
+// releaseSlot returns a concurrency slot to the pool. It is bound to a
+// stream's close and therefore runs at most once per request.
+func (c *Client) releaseSlot() {
+	if c.slots != nil {
+		<-c.slots
+	}
 }
 
 func (c *Client) deleteStream(s *stream) {
@@ -517,9 +586,22 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 	} else {
 		flags = flagRemoteClosed
 	}
-	s, err := c.createStream(flags, p, streamRecvBufferSize)
+	s, err := c.createStream(ctx, flags, p, streamRecvBufferSize)
 	if err != nil {
 		return nil, err
+	}
+
+	if done := ctx.Done(); done != nil {
+		// If the caller's context is cancelled, retire the stream: stop
+		// waiting for its replies, discard late frames instead of
+		// delivering them, and release its concurrency slot.
+		go func() {
+			select {
+			case <-done:
+				c.deleteStream(s)
+			case <-s.recvClose:
+			}
+		}()
 	}
 
 	return &clientStream{
@@ -536,7 +618,7 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 		return err
 	}
 
-	s, err := c.createStream(0, p, 1)
+	s, err := c.createStream(ctx, 0, p, 1)
 	if err != nil {
 		return err
 	}
