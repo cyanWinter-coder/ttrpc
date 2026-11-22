@@ -107,6 +107,19 @@ func (m MD) fromRequest(r *Request) {
 	}
 }
 
+// snapshotMetadata returns a frozen copy of the metadata attached to ctx,
+// if any. The snapshot is bound to a single call's lifecycle: mutations of
+// the caller's MD (e.g. by retries or asynchronous users of the parent
+// context) do not affect the snapshot, and mutations of the snapshot by
+// interceptors never write back to the caller's MD.
+func snapshotMetadata(ctx context.Context) (MD, bool) {
+	md, ok := GetMetadata(ctx)
+	if !ok {
+		return nil, false
+	}
+	return md.Clone(), true
+}
+
 type metadataKey struct{}
 
 // GetMetadata retrieves metadata from context.Context (previously attached with WithMetadata)

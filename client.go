@@ -153,13 +153,18 @@ func (c *Client) Call(ctx context.Context, service, method string, req, resp any
 			Service: service,
 			Method:  method,
 			Payload: payload,
-			// TODO: metadata from context
 		}
 
 		cresp = &Response{}
 	)
 
-	if metadata, ok := GetMetadata(ctx); ok {
+	if metadata, ok := snapshotMetadata(ctx); ok {
+		// Freeze the metadata before entering the interceptor chain and
+		// bind the snapshot to this call's context. The wire request is
+		// built from the snapshot, and interceptor mutations are visible
+		// only within this call — they never write back to the caller's
+		// MD, so concurrent calls sharing it cannot corrupt each other.
+		ctx = WithMetadata(ctx, metadata)
 		metadata.setRequest(creq)
 	}
 
@@ -203,6 +208,7 @@ type clientStream struct {
 	s            *stream
 	c            *Client
 	desc         *StreamDesc
+	mu           sync.Mutex
 	localClosed  bool
 	remoteClosed bool
 }
@@ -211,22 +217,43 @@ func (cs *clientStream) CloseSend() error {
 	if !cs.desc.StreamingClient {
 		return fmt.Errorf("%w: cannot close non-streaming client", ErrProtocol)
 	}
+	cs.mu.Lock()
 	if cs.localClosed {
+		cs.mu.Unlock()
 		return ErrStreamClosed
 	}
-	err := cs.s.send(messageTypeData, flagRemoteClosed|flagNoData, nil)
-	if err != nil {
+	cs.localClosed = true
+	cs.mu.Unlock()
+	if err := cs.s.send(messageTypeData, flagRemoteClosed|flagNoData, nil); err != nil {
 		return filterCloseErr(err)
 	}
-	cs.localClosed = true
 	return nil
+}
+
+// closeSendOnCancel closes the send side of the stream after the caller's
+// context was cancelled, so the server observes the end of the stream
+// through its own context/RecvMsg rather than a connection-level signal.
+// It is a no-op if the send side was already closed.
+func (cs *clientStream) closeSendOnCancel() {
+	cs.mu.Lock()
+	if cs.localClosed {
+		cs.mu.Unlock()
+		return
+	}
+	cs.localClosed = true
+	cs.mu.Unlock()
+	// Best effort: the connection may already be gone.
+	cs.s.send(messageTypeData, flagRemoteClosed|flagNoData, nil) //nolint:errcheck
 }
 
 func (cs *clientStream) SendMsg(m any) error {
 	if !cs.desc.StreamingClient {
 		return fmt.Errorf("%w: cannot send data from non-streaming client", ErrProtocol)
 	}
-	if cs.localClosed {
+	cs.mu.Lock()
+	localClosed := cs.localClosed
+	cs.mu.Unlock()
+	if localClosed {
 		return ErrStreamClosed
 	}
 
@@ -504,7 +531,13 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 		Service: service,
 		Method:  method,
 		Payload: payload,
-		// TODO: metadata from context
+	}
+	if metadata, ok := snapshotMetadata(ctx); ok {
+		// Frozen snapshot for the lifetime of the stream; see Call.
+		metadata.setRequest(request)
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		request.TimeoutNano = time.Until(dl).Nanoseconds()
 	}
 	p, err := c.codec.Marshal(request)
 	if err != nil {
@@ -522,12 +555,28 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 		return nil, err
 	}
 
-	return &clientStream{
+	cs := &clientStream{
 		ctx:  ctx,
 		s:    s,
 		c:    c,
 		desc: desc,
-	}, nil
+	}
+
+	if desc.StreamingClient && ctx.Done() != nil {
+		// Propagate cancellation of the caller's context to the server:
+		// when the context is done, close the send side so the server's
+		// RecvMsg unblocks instead of waiting for a connection-level
+		// signal. The watcher exits when the stream is closed.
+		go func() {
+			select {
+			case <-ctx.Done():
+				cs.closeSendOnCancel()
+			case <-s.recvClose:
+			}
+		}()
+	}
+
+	return cs, nil
 }
 
 func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) error {
