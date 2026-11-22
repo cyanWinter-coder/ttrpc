@@ -56,7 +56,7 @@ func NewServer(opts ...ServerOpt) (*Server, error) {
 
 	return &Server{
 		config:      config,
-		services:    newServiceSet(config.interceptor),
+		services:    newServiceSet(config.interceptor, config.streamRecvBudget),
 		done:        make(chan struct{}),
 		listeners:   make(map[net.Listener]struct{}),
 		connections: make(map[*serverConn]struct{}),
@@ -423,7 +423,7 @@ func (c *serverConn) run(sctx context.Context) {
 						return err
 					}
 
-					if err := sh.data(unmarshal); err != nil {
+					if err := sh.data(ctx, unmarshal, len(p)); err != nil {
 						if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "data handling error: %v", err)) {
 							return
 						}

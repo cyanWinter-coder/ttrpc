@@ -24,6 +24,10 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+	// streamRecvBudget bounds the cumulative unconsumed payload bytes a
+	// single stream may retain on a connection. Zero keeps the legacy
+	// behavior where a full stream is closed after a timeout.
+	streamRecvBudget int
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -82,5 +86,26 @@ func chainUnaryServerInterceptors(info *UnaryServerInfo, method Method, intercep
 	return func(ctx context.Context, unmarshal func(any) error) (any, error) {
 		return interceptors[0](ctx, unmarshal, info,
 			chainUnaryServerInterceptors(info, method, interceptors[1:]))
+	}
+}
+
+// WithServerStreamReceiveBudget limits, per stream, the cumulative payload
+// bytes that may arrive and wait unconsumed on a server connection. When a
+// stream reaches the budget only that stream's inbound delivery is blocked
+// (applying backpressure on the connection receive loop); other streams on
+// the same connection continue to be serviced in bounded round-robin order.
+// As the handler consumes messages the budget is released and delivery
+// resumes immediately.
+//
+// A budget of zero (the default) preserves the legacy behavior: a stream
+// whose receive buffer stays full is closed with ErrStreamFull after a
+// timeout rather than being back-pressured.
+func WithServerStreamReceiveBudget(bytes int) ServerOpt {
+	return func(c *serverConfig) error {
+		if bytes < 0 {
+			return errors.New("stream receive budget must not be negative")
+		}
+		c.streamRecvBudget = bytes
+		return nil
 	}
 }

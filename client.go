@@ -44,6 +44,12 @@ type Client struct {
 	nextStreamID streamID
 	sendLock     sync.Mutex
 
+	// streamRecvBudget is the maximum total unconsumed payload bytes a
+	// single stream may retain. A zero value selects the legacy behavior
+	// where a full stream mailbox is closed with ErrStreamFull after a
+	// timeout instead of applying stream-level backpressure.
+	streamRecvBudget int
+
 	ctx    context.Context
 	closed func()
 
@@ -56,6 +62,24 @@ type Client struct {
 
 // ClientOpts configures a client
 type ClientOpts func(c *Client)
+
+// WithStreamReceiveBudget limits, per stream, the cumulative payload bytes
+// that may arrive from the server and wait unconsumed on the client
+// connection. When a stream reaches the budget only that stream's inbound
+// delivery is blocked; other streams on the same connection continue to be
+// serviced in bounded round-robin order. Calling RecvMsg releases the budget
+// and delivery resumes immediately.
+//
+// A budget of zero (the default) preserves the legacy behavior: a stream
+// whose receive buffer stays full is closed with ErrStreamFull after a
+// timeout rather than being back-pressured.
+func WithStreamReceiveBudget(bytes int) ClientOpts {
+	return func(c *Client) {
+		if bytes > 0 {
+			c.streamRecvBudget = bytes
+		}
+	}
+}
 
 // WithOnClose sets the close func whenever the client's Close() method is called
 func WithOnClose(onClose func()) ClientOpts {
@@ -254,18 +278,9 @@ func (cs *clientStream) RecvMsg(m any) error {
 		return io.EOF
 	}
 
-	var msg *streamMessage
-	select {
-	case <-cs.ctx.Done():
-		return cs.ctx.Err()
-	case <-cs.s.recvClose:
-		// If recv has a pending message, process that first
-		select {
-		case msg = <-cs.s.recv:
-		default:
-			return cs.s.recvErr
-		}
-	case msg = <-cs.s.recv:
+	msg, err := cs.s.mb.next(cs.ctx)
+	if err != nil {
+		return err
 	}
 
 	switch msg.header.Type {
@@ -417,7 +432,7 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		default:
 		}
 
-		s = newStream(c.nextStreamID, c, recvBuf)
+		s = newStream(c.nextStreamID, c, recvBuf, c.streamRecvBudget)
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
 
@@ -542,20 +557,9 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 	}
 	defer c.deleteStream(s)
 
-	var msg *streamMessage
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.ctx.Done():
-		return ErrClosed
-	case <-s.recvClose:
-		// If recv has a pending message, process that first
-		select {
-		case msg = <-s.recv:
-		default:
-			return s.recvErr
-		}
-	case msg = <-s.recv:
+	msg, err := s.mb.next(ctx)
+	if err != nil {
+		return err
 	}
 
 	if msg.header.Type == messageTypeResponse {

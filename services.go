@@ -23,7 +23,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"time"
 	"unsafe"
 
 	"google.golang.org/grpc/codes"
@@ -50,13 +49,17 @@ type serviceSet struct {
 	services          map[string]*ServiceDesc
 	unaryInterceptor  UnaryServerInterceptor
 	streamInterceptor StreamServerInterceptor
+	// streamRecvBudget is the per-stream maximum unconsumed payload byte
+	// budget. Zero selects the legacy timeout-based behavior.
+	streamRecvBudget int
 }
 
-func newServiceSet(interceptor UnaryServerInterceptor) *serviceSet {
+func newServiceSet(interceptor UnaryServerInterceptor, streamRecvBudget int) *serviceSet {
 	return &serviceSet{
 		services:          make(map[string]*ServiceDesc),
 		unaryInterceptor:  interceptor,
 		streamInterceptor: defaultStreamServerInterceptor,
+		streamRecvBudget:  streamRecvBudget,
 	}
 }
 
@@ -136,7 +139,7 @@ func (s *serviceSet) handle(ctx context.Context, req *Request, respond func(*sta
 		sh := &streamHandler{
 			ctx:     ctx,
 			respond: respond,
-			recv:    make(chan Unmarshaler, recvBuf),
+			mb:      newStreamMailbox[Unmarshaler](recvBuf, s.streamRecvBudget),
 			info:    info,
 		}
 		go func() {
@@ -153,7 +156,7 @@ func (s *serviceSet) handle(ctx context.Context, req *Request, respond func(*sta
 			unmarshal := func(obj any) error {
 				return protoUnmarshal(req.Payload, obj)
 			}
-			if err := sh.data(unmarshal); err != nil {
+			if err := sh.data(ctx, unmarshal, len(req.Payload)); err != nil {
 				return nil, err
 			}
 		}
@@ -172,7 +175,7 @@ const streamRecvBufferSize = 64
 type streamHandler struct {
 	ctx     context.Context
 	respond func(*status.Status, []byte, bool, bool) error
-	recv    chan Unmarshaler
+	mb      *streamMailbox[Unmarshaler]
 	info    *StreamServerInfo
 
 	remoteClosed bool
@@ -182,31 +185,15 @@ type streamHandler struct {
 func (s *streamHandler) closeSend() {
 	if !s.remoteClosed {
 		s.remoteClosed = true
-		close(s.recv)
+		s.mb.closeSend()
 	}
 }
 
-func (s *streamHandler) data(unmarshal Unmarshaler) error {
+func (s *streamHandler) data(ctx context.Context, unmarshal Unmarshaler, size int) error {
 	if s.remoteClosed {
 		return ErrStreamClosed
 	}
-	select {
-	case s.recv <- unmarshal:
-		return nil
-	case <-s.ctx.Done():
-		return s.ctx.Err()
-	default:
-		// If recv channel is full, wait up to a second for an item
-		// to drain and unblock, otherwise return an error.
-		select {
-		case s.recv <- unmarshal:
-			return nil
-		case <-s.ctx.Done():
-			return s.ctx.Err()
-		case <-time.After(time.Second):
-			return ErrStreamFull
-		}
-	}
+	return s.mb.deliver(ctx, unmarshal, size)
 }
 
 func (s *streamHandler) SendMsg(m any) error {
@@ -221,16 +208,11 @@ func (s *streamHandler) SendMsg(m any) error {
 }
 
 func (s *streamHandler) RecvMsg(m any) error {
-	select {
-	case unmarshal, ok := <-s.recv:
-		if !ok {
-			return io.EOF
-		}
-		return unmarshal(m)
-	case <-s.ctx.Done():
-		return s.ctx.Err()
-
+	unmarshal, err := s.mb.next(s.ctx)
+	if err != nil {
+		return err
 	}
+	return unmarshal(m)
 }
 
 func protoUnmarshal(p []byte, obj any) error {

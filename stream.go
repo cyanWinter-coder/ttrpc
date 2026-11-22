@@ -19,7 +19,6 @@ package ttrpc
 import (
 	"context"
 	"sync"
-	"time"
 )
 
 type streamID uint32
@@ -32,30 +31,24 @@ type streamMessage struct {
 type stream struct {
 	id     streamID
 	sender sender
-	recv   chan *streamMessage
+	mb     *streamMailbox[*streamMessage]
 
+	// closeOnce guarantees the mailbox's terminal transition runs a single
+	// time regardless of how many close paths trigger it.
 	closeOnce sync.Once
-	recvErr   error
-	recvClose chan struct{}
 }
 
-func newStream(id streamID, send sender, recvBuf int) *stream {
+func newStream(id streamID, send sender, recvBuf, recvBudget int) *stream {
 	return &stream{
-		id:        id,
-		sender:    send,
-		recv:      make(chan *streamMessage, recvBuf),
-		recvClose: make(chan struct{}),
+		id:     id,
+		sender: send,
+		mb:     newStreamMailbox[*streamMessage](recvBuf, recvBudget),
 	}
 }
 
 func (s *stream) closeWithError(err error) error {
 	s.closeOnce.Do(func() {
-		if err != nil {
-			s.recvErr = err
-		} else {
-			s.recvErr = ErrClosed
-		}
-		close(s.recvClose)
+		s.mb.closeWithError(err)
 	})
 	return nil
 }
@@ -65,38 +58,12 @@ func (s *stream) send(mt messageType, flags uint8, b []byte) error {
 }
 
 // receive delivers a message to this stream from the connection receive loop.
-// If the stream's recv buffer is full, it waits up to 1 second for the
-// consumer to make progress. This keeps the receive loop moving for other
-// streams while still providing backpressure under normal operation. If the
-// timeout expires the stream is closed with ErrStreamFull.
+// All backpressure, byte-budget accounting, fairness and terminal-state
+// handling live in the stream's mailbox. The receive loop is never held up
+// beyond the budget of the stream a frame belongs to: a blocked frame is
+// parked inside the mailbox while the loop continues servicing other streams.
 func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
-	select {
-	case <-s.recvClose:
-		return s.recvErr
-	default:
-	}
-	select {
-	case <-s.recvClose:
-		return s.recvErr
-	case s.recv <- msg:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		// If recv channel is full, wait up to a second for an item
-		// to drain and unblock, otherwise close the stream.
-		select {
-		case <-s.recvClose:
-			return s.recvErr
-		case s.recv <- msg:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-			s.closeWithError(ErrStreamFull)
-			return ErrStreamFull
-		}
-	}
+	return s.mb.deliver(ctx, msg, len(msg.payload))
 }
 
 type sender interface {
