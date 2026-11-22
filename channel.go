@@ -36,9 +36,11 @@ const (
 type messageType uint8
 
 const (
-	messageTypeRequest  messageType = 0x1
-	messageTypeResponse messageType = 0x2
-	messageTypeData     messageType = 0x3
+	messageTypeRequest        messageType = 0x1
+	messageTypeResponse       messageType = 0x2
+	messageTypeData           messageType = 0x3
+	messageTypeNegotiation    messageType = 0x4
+	messageTypeNegotiationAck messageType = 0x5
 )
 
 func (mt messageType) String() string {
@@ -49,6 +51,10 @@ func (mt messageType) String() string {
 		return "response"
 	case messageTypeData:
 		return "data"
+	case messageTypeNegotiation:
+		return "negotiation"
+	case messageTypeNegotiationAck:
+		return "negotiation-ack"
 	default:
 		return "unknown"
 	}

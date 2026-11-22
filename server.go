@@ -54,13 +54,22 @@ func NewServer(opts ...ServerOpt) (*Server, error) {
 		config.interceptor = defaultServerInterceptor
 	}
 
-	return &Server{
+	server := &Server{
 		config:      config,
 		services:    newServiceSet(config.interceptor),
 		done:        make(chan struct{}),
 		listeners:   make(map[net.Listener]struct{}),
 		connections: make(map[*serverConn]struct{}),
-	}, nil
+	}
+
+	// Negotiation is opt-in. When enabled it wraps the configured
+	// handshaker so the legacy connection approval path stays byte-for-byte
+	// compatible when negotiation is not requested.
+	if config.negotiation {
+		config.handshaker = newServerNegotiationHandshaker(server, config.handshaker, config.negotiationTimeout)
+	}
+
+	return server, nil
 }
 
 // Register registers a map of methods to method handlers
@@ -290,6 +299,15 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
 	}
+	if result, ok := handshake.(*handshakeResult); ok && result.negotiation != nil {
+		// Publish the negotiated view once for this connection. The
+		// snapshot is immutable: later RegisterService calls cannot change
+		// which services this connection routes to.
+		c.negotiation = result.negotiation
+		c.serviceView = result.serviceView
+		// Reuse the negotiation channel to preserve its buffered reader.
+		c.channel = result.channel
+	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
 		c.close()
@@ -299,10 +317,13 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 }
 
 type serverConn struct {
-	server    *Server
-	conn      net.Conn
-	handshake any // data from handshake, not used for now
-	state     atomic.Value
+	server      *Server
+	conn        net.Conn
+	handshake   any // data from handshake, not used for now
+	state       atomic.Value
+	negotiation *NegotiationResult      // immutable negotiated view, nil without negotiation
+	serviceView map[string]*ServiceDesc // nil unless negotiation took place
+	channel     *channel                // nil unless negotiation took place
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
@@ -337,7 +358,7 @@ func (c *serverConn) run(sctx context.Context) {
 	)
 
 	var (
-		ch                     = newChannel(c.conn)
+		ch                     = c.channel
 		ctx, cancel            = context.WithCancel(sctx)
 		state        connState = connStateIdle
 		responses              = make(chan response)
@@ -347,6 +368,9 @@ func (c *serverConn) run(sctx context.Context) {
 		active       int32
 		lastStreamID uint32
 	)
+	if ch == nil {
+		ch = newChannel(c.conn)
+	}
 
 	defer c.conn.Close()
 	defer cancel()
@@ -405,6 +429,21 @@ func (c *serverConn) run(sctx context.Context) {
 					return
 				}
 				continue
+			}
+
+			// Enforce the negotiated capability view. Connections without
+			// negotiation keep the unrestricted legacy behavior; negotiated
+			// connections may only use features present in the published
+			// intersection of capabilities.
+			if c.negotiation != nil && c.negotiation.Capabilities&CapabilityStreaming == 0 {
+				if mh.Type == messageTypeData ||
+					(mh.Type == messageTypeRequest && mh.Flags&flagRemoteOpen == flagRemoteOpen) {
+					if !sendStatus(mh.StreamID, status.Newf(codes.PermissionDenied,
+						"streaming is not enabled by the negotiated capabilities")) {
+						return
+					}
+					continue
+				}
 			}
 
 			if mh.Type == messageTypeData {
@@ -478,7 +517,7 @@ func (c *serverConn) run(sctx context.Context) {
 					}
 					return nil
 				}
-				sh, err := c.server.services.handle(ctx, &req, respond)
+				sh, err := c.server.services.handle(ctx, c.serviceView, &req, respond)
 				if err != nil {
 					status, _ := status.FromError(err)
 					if !sendStatus(mh.StreamID, status) {

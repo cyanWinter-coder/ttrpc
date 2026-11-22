@@ -19,11 +19,14 @@ package ttrpc
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 type serverConfig struct {
-	handshaker  Handshaker
-	interceptor UnaryServerInterceptor
+	handshaker         Handshaker
+	interceptor        UnaryServerInterceptor
+	negotiation        bool
+	negotiationTimeout time.Duration
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -39,6 +42,35 @@ func WithServerHandshaker(handshaker Handshaker) ServerOpt {
 			return errors.New("only one handshaker allowed per server")
 		}
 		c.handshaker = handshaker
+		return nil
+	}
+}
+
+// WithServerNegotiation enables in-band capability negotiation. When
+// enabled, every connection exchanges its protocol version, the server's
+// service set and capability bits before any RPC is admitted; connections
+// missing a required service are rejected immediately and their resources
+// are released through the single negotiation cleanup path.
+//
+// Negotiation is opt-in: without this option the connection behavior is
+// unchanged and no additional bytes are written to the socket. A custom
+// handshaker configured with WithServerHandshaker still runs first and is
+// composed with negotiation.
+func WithServerNegotiation() ServerOpt {
+	return func(c *serverConfig) error {
+		c.negotiation = true
+		return nil
+	}
+}
+
+// WithNegotiationTimeout bounds each negotiation exchange. A non-positive
+// value restores the package default.
+func WithNegotiationTimeout(timeout time.Duration) ServerOpt {
+	return func(c *serverConfig) error {
+		if timeout <= 0 {
+			return errors.New("negotiation timeout must be positive")
+		}
+		c.negotiationTimeout = timeout
 		return nil
 	}
 }

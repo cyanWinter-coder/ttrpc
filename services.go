@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -47,6 +48,7 @@ type ServiceDesc struct {
 }
 
 type serviceSet struct {
+	mu                sync.RWMutex
 	services          map[string]*ServiceDesc
 	unaryInterceptor  UnaryServerInterceptor
 	streamInterceptor StreamServerInterceptor
@@ -61,11 +63,42 @@ func newServiceSet(interceptor UnaryServerInterceptor) *serviceSet {
 }
 
 func (s *serviceSet) register(name string, desc *ServiceDesc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.services[name]; ok {
 		panic(fmt.Errorf("duplicate service %v registered", name))
 	}
 
 	s.services[name] = desc
+}
+
+// snapshot returns an immutable copy of the service set visible at call
+// time. Capability negotiation publishes this view once per connection;
+// services registered afterwards never reach an already negotiated
+// connection through this snapshot.
+func (s *serviceSet) snapshot() map[string]*ServiceDesc {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string]*ServiceDesc, len(s.services))
+	for name, desc := range s.services {
+		out[name] = desc
+	}
+	return out
+}
+
+// lookup resolves a service from the set. When view is non-nil, the lookup
+// is constrained to that connection's negotiated snapshot instead.
+func (s *serviceSet) lookup(view map[string]*ServiceDesc, name string) (*ServiceDesc, bool) {
+	if view != nil {
+		desc, ok := view[name]
+		return desc, ok
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	desc, ok := s.services[name]
+	return desc, ok
 }
 
 func (s *serviceSet) unaryCall(ctx context.Context, method Method, info *UnaryServerInfo, data []byte) (p []byte, st *status.Status) {
@@ -102,8 +135,8 @@ func (s *serviceSet) streamCall(ctx context.Context, stream StreamHandler, info 
 	return
 }
 
-func (s *serviceSet) handle(ctx context.Context, req *Request, respond func(*status.Status, []byte, bool, bool) error) (*streamHandler, error) {
-	srv, ok := s.services[req.Service]
+func (s *serviceSet) handle(ctx context.Context, view map[string]*ServiceDesc, req *Request, respond func(*status.Status, []byte, bool, bool) error) (*streamHandler, error) {
+	srv, ok := s.lookup(view, req.Service)
 	if !ok {
 		return nil, status.Errorf(codes.Unimplemented, "service %v", req.Service)
 	}

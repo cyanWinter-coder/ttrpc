@@ -52,6 +52,11 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+
+	// negotiation is the immutable view published exactly once during
+	// capability negotiation. It stays nil for clients created through
+	// NewClient, which keeps the non-negotiation path unchanged.
+	negotiation *NegotiationResult
 }
 
 // ClientOpts configures a client
@@ -109,12 +114,19 @@ func chainUnaryInterceptors(interceptors []UnaryClientInterceptor, final Invoker
 
 // NewClient creates a new ttrpc client using the given connection
 func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
+	return newClient(conn, newChannel(conn), opts...)
+}
+
+// newClient is the shared client constructor. Passing an existing channel
+// lets a connection that already consumed frames during capability
+// negotiation reuse its buffered reader instead of silently losing the bytes
+// parked in a second bufio.Reader.
+func newClient(conn net.Conn, ch *channel, opts ...ClientOpts) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
-	channel := newChannel(conn)
 	c := &Client{
 		codec:           codec{},
 		conn:            conn,
-		channel:         channel,
+		channel:         ch,
 		streams:         make(map[streamID]*stream),
 		nextStreamID:    1,
 		closed:          cancel,
@@ -491,6 +503,12 @@ func filterCloseErr(err error) error {
 // specified service and method. If not a streaming client, the request object
 // may be provided.
 func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, method string, req any) (ClientStream, error) {
+	// Honor the immutable negotiated view. A client without negotiation
+	// keeps the unrestricted legacy behavior.
+	if c.negotiation != nil && c.negotiation.Capabilities&CapabilityStreaming == 0 {
+		return nil, fmt.Errorf("%w: streaming is not enabled by the negotiated capabilities", ErrProtocol)
+	}
+
 	var payload []byte
 	if req != nil {
 		var err error

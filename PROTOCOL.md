@@ -51,11 +51,55 @@ initiated streams. Server initiated streams are not currently supported.
 
 ## Mesage Types
 
-| Message Type | Name     | Description                      |
-|--------------|----------|----------------------------------|
-| 0x01         | Request  | Initiates stream                 |
-| 0x02         | Response | Final stream data and terminates |
-| 0x03         | Data     | Stream data                      |
+| Message Type | Name            | Description                              |
+|--------------|-----------------|------------------------------------------|
+| 0x01         | Request         | Initiates stream                         |
+| 0x02         | Response        | Final stream data and terminates         |
+| 0x03         | Data            | Stream data                              |
+| 0x04         | Negotiation     | Client capability negotiation offer      |
+| 0x05         | Negotiation Ack | Server capability negotiation result     |
+
+### Negotiation
+
+Capability negotiation is an optional, in-band exchange that completes
+before any application stream is opened. It is opt-in per implementation:
+peers that do not negotiate keep the legacy behavior and write no
+negotiation bytes at all.
+
+Both negotiation messages reuse the standard 10-byte message frame with a
+stream identifier of zero, which no application stream may use. The client
+sends a single Negotiation frame and the server answers with a single
+Negotiation Ack frame. The payloads are compact length-prefixed binary
+records rather than protobuf messages.
+
+The client offer declares the protocol version it implements, the oldest
+version it can interoperate with, a bitmask of capability bits, and the
+list of services it requires. The server snapshot of its registered
+services is taken while handling the offer and the ack carries the agreed
+version, the intersection of the capability bitmasks, the snapshot of
+service names, and a status code. When a required service is missing or the
+version windows do not overlap, the server rejects the connection in the
+ack and the connection is closed; no application data is admitted on a
+rejected connection.
+
+The negotiated view (version, capability intersection and service
+snapshot) is published exactly once per connection and is immutable for its
+whole lifetime. Services registered on the server after the handshake do
+not change the view of an already negotiated connection, although they are
+visible to connections negotiated later. A truncated exchange or a
+negotiation timeout releases the socket and the negotiation goroutines
+through a single cleanup path without waiting for any process to exit.
+
+#### Capability Bits
+
+| Bit  | Name      | Description                          |
+|------|-----------|--------------------------------------|
+| 0x01 | Streaming | Stream (non-unary) RPCs are allowed |
+
+Unknown capability bits are ignored so new capabilities can be introduced
+without breaking older peers. A negotiated connection may only use features
+present in the published capability intersection; connections without
+negotiation keep the unrestricted legacy behavior.
 
 ### Request
 
@@ -234,7 +278,8 @@ routing by procedure name and a response type which supports call status.
 
 ## Version History
 
-| Version | Features            |
-|---------|---------------------|
-| 1.0     | Unary requests only |
-| 1.2     | Streaming support   |
+| Version | Features                          |
+|---------|-----------------------------------|
+| 1.0     | Unary requests only               |
+| 1.2     | Streaming support                 |
+| 1.3     | Optional capability negotiation   |
